@@ -116,7 +116,7 @@ class VLLMServer:
         )
 
         # Wait for server to be ready
-        return self._wait_for_ready(timeout=300)
+        return self._wait_for_ready(timeout=600)
 
     def stop(self):
         """Stop the vLLM server."""
