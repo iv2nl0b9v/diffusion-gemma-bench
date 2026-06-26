@@ -105,9 +105,10 @@ class VLLMServer:
         env = os.environ.copy()
         env["VLLM_LOGGING_LEVEL"] = "WARNING"
 
+        self.log_file = open("vllm_server.log", "w")
         self.process = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
+            stdout=self.log_file,
             stderr=subprocess.STDOUT,
             text=True,
             env=env,
@@ -119,6 +120,13 @@ class VLLMServer:
 
     def stop(self):
         """Stop the vLLM server."""
+        if hasattr(self, 'log_file') and self.log_file:
+            try:
+                self.log_file.close()
+            except Exception:
+                pass
+            self.log_file = None
+
         if self.process is None:
             return
 
@@ -154,7 +162,16 @@ class VLLMServer:
 
             # Check if process died
             if self.process.poll() is not None:
-                stdout = self.process.stdout.read() if self.process.stdout else ""
+                if hasattr(self, 'log_file') and self.log_file:
+                    try:
+                        self.log_file.flush()
+                    except Exception:
+                        pass
+                try:
+                    with open("vllm_server.log") as lf:
+                        stdout = lf.read()
+                except Exception:
+                    stdout = ""
                 log.error(f"vLLM server exited with code {self.process.returncode}")
                 log.error(f"Server output:\n{stdout[-2000:]}")
                 return False
@@ -214,6 +231,7 @@ def generate_prompt(length: int) -> str:
 
 def run_single_request(
     base_url: str,
+    model_name: str,
     prompt: str,
     max_tokens: int,
     temperature: float = 0.0,
@@ -226,12 +244,14 @@ def run_single_request(
     """
     url = f"{base_url}/v1/completions"
     payload = {
-        "model": "default",
+        "model": model_name,
         "prompt": prompt,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "stream": stream,
     }
+    if stream:
+        payload["stream_options"] = {"include_usage": True}
 
     token_timestamps = []
     first_token_time = None
@@ -261,6 +281,11 @@ def run_single_request(
                     first_token_time = now
                 token_timestamps.append(now)
                 output_tokens += 1
+
+            # Extract exact token count from stream options usage block if present
+            usage = data.get("usage")
+            if usage and "completion_tokens" in usage:
+                output_tokens = usage["completion_tokens"]
     else:
         resp = requests.post(url, json=payload, timeout=300)
         resp.raise_for_status()
@@ -292,6 +317,7 @@ def run_single_request(
 
 def run_concurrent_benchmark(
     base_url: str,
+    model_name: str,
     prompt: str,
     max_tokens: int,
     num_requests: int,
@@ -314,7 +340,7 @@ def run_concurrent_benchmark(
 
     def _run_one(_idx: int) -> dict:
         return run_single_request(
-            base_url, prompt, max_tokens, temperature, stream=use_stream
+            base_url, model_name, prompt, max_tokens, temperature, stream=use_stream
         )
 
     # Warmup phase
@@ -507,8 +533,10 @@ def run_phase1_single_stream(
         return []
 
     prompt = generate_prompt(EXPERIMENT_CONFIG.input_length)
+    model_name = get_checkpoint(model_slug, gpu_slug)
     raw = run_concurrent_benchmark(
         base_url=server.base_url,
+        model_name=model_name,
         prompt=prompt,
         max_tokens=256,
         num_requests=EXPERIMENT_CONFIG.num_prompts,
@@ -557,8 +585,10 @@ def run_phase2_batch_sweep(
             continue
 
         try:
+            model_name = get_checkpoint(model_slug, gpu_slug)
             raw = run_concurrent_benchmark(
                 base_url=server.base_url,
+                model_name=model_name,
                 prompt=prompt,
                 max_tokens=256,
                 num_requests=EXPERIMENT_CONFIG.num_prompts,
@@ -627,8 +657,10 @@ def run_phase3_output_sweep(
                 continue
 
             try:
+                model_name = get_checkpoint(model_slug, gpu_slug)
                 raw = run_concurrent_benchmark(
                     base_url=server.base_url,
+                    model_name=model_name,
                     prompt=prompt,
                     max_tokens=out_len,
                     num_requests=EXPERIMENT_CONFIG.num_prompts,
@@ -689,8 +721,10 @@ def run_phase4_denoising_sweep(
         # or by restarting the server with different args.
         # For now, we pass it as a generation parameter if supported.
         try:
+            model_name = get_checkpoint(model_slug, gpu_slug)
             raw = run_concurrent_benchmark(
                 base_url=server.base_url,
+                model_name=model_name,
                 prompt=prompt,
                 max_tokens=256,
                 num_requests=EXPERIMENT_CONFIG.num_prompts,
@@ -832,6 +866,19 @@ def run_all_phases(
                     if r.model == model_slug and r.gpu_util_pct is None:
                         r.gpu_util_pct = gpu_stats.get("gpu_util_pct")
                         r.mem_util_pct = gpu_stats.get("mem_util_pct")
+
+            # Clean up model cache from disk to prevent out of space errors on limited storage
+            if not dry_run:
+                try:
+                    import shutil
+                    checkpoint_slug = checkpoint.replace("/", "--")
+                    cache_dir = Path("/workspace/.hf_home/hub") / f"models--{checkpoint_slug}"
+                    if cache_dir.exists():
+                        log.info(f"Cleaning up model cache at {cache_dir} to free disk space...")
+                        shutil.rmtree(cache_dir)
+                        log.info("Model cache cleanup complete.")
+                except Exception as e:
+                    log.warning(f"Failed to clean up model cache directory: {e}")
 
     # Save all results
     output_file = results_dir / f"results_{gpu_slug}.json"

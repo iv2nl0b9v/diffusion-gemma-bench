@@ -143,11 +143,11 @@ class ExperimentConfig:
     warmup_prompts: int = 10
     temperature: float = 0.0
     max_model_len: int = 2048
-    gpu_memory_utilization: float = 0.90
+    gpu_memory_utilization: float = 0.80
     denoising_steps_sweep: List[int] = field(
         default_factory=lambda: [10, 15, 20, 25, 30]
     )
-    vllm_port: int = 8000
+    vllm_port: int = 18080
     results_dir: str = "results"
 
 
